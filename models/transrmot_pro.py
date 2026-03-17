@@ -45,13 +45,29 @@ from .segmentation import sigmoid_focal_loss
 from .position_encoding import PositionEmbeddingSine1D
 from torch.cuda.amp import autocast as autocast
 from .spatial_temporal_reason import SpatialTemporalReasoner
-os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface tokenizer warning (printed every epoch)
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface tokenizer warning (printed every epoch)
+import os
+import sys
+
+try:
+    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+
+    from GroundingDINO.groundingdino.util.inference import load_model
+
+except Exception as e:
+    print("GroundingDINO import failed:", repr(e))
+    load_model  = None
 class ClipMatcher(SetCriterion):
     def __init__(self, num_classes,
-                        matcher,
-                        weight_dict,
-                        losses):
+                 matcher,
+                 weight_dict,
+                 losses,
+                 distill_teacher=True,
+                 distill_score_thresh=0.3):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -68,7 +84,8 @@ class ClipMatcher(SetCriterion):
         self.focal_loss = True
         self.losses_dict = {}
         self._current_frame_idx = 0
-
+        self.distill_teacher = distill_teacher
+        self.distill_score_thresh = distill_score_thresh
     def initialize_for_single_clip(self, gt_instances: List[Instances], dataset_name=None):
         self.gt_instances = gt_instances
         self.num_samples = 0
@@ -79,6 +96,89 @@ class ClipMatcher(SetCriterion):
 
     def _step(self):
         self._current_frame_idx += 1
+
+    def _build_teacher_targets(self, teacher_outputs: dict, device: torch.device):
+        if teacher_outputs is None:
+            return None
+
+        boxes = teacher_outputs.get('boxes', None)
+        logits = teacher_outputs.get('logits', None)
+        scores = teacher_outputs.get('scores', None)
+        labels = teacher_outputs.get('labels', None)
+        if boxes is None or logits is None:
+            return None
+
+        boxes = boxes.to(device)
+        logits = logits.to(device)
+
+        if boxes.numel() == 0:
+            return None
+
+        if scores is None:
+            scores = logits[..., 0].sigmoid()
+        else:
+            scores = scores.to(device)
+
+        keep = scores >= self.distill_score_thresh
+        if keep.ndim > 1:
+            keep = keep.squeeze(-1)
+        if keep.sum() == 0:
+            return None
+
+        boxes = boxes[keep]
+        logits = logits[keep]
+
+        if labels is None:
+            labels = torch.zeros((boxes.shape[0],), dtype=torch.int64, device=device)
+        else:
+            labels = labels.to(device)[keep].long()
+
+        return {'boxes': boxes, 'logits': logits, 'labels': labels}
+
+    def calc_distill_loss_for_single_frame(self, student_outputs: dict, teacher_outputs: dict):
+        if not self.distill_teacher:
+            return
+
+        frame_id = self._current_frame_idx
+        pred_logits = student_outputs['pred_logits']
+        pred_boxes = student_outputs['pred_boxes']
+        device = pred_logits.device
+
+        teacher_targets = self._build_teacher_targets(teacher_outputs, device)
+        if teacher_targets is None:
+            zero = pred_logits.sum() * 0.0
+            self.losses_dict.update({
+                f'frame_{frame_id}_loss_distill_bbox': zero,
+                f'frame_{frame_id}_loss_distill_cls': zero,
+            })
+            return
+
+        outputs = {'pred_logits': pred_logits, 'pred_boxes': pred_boxes}
+        indices = self.matcher(outputs, [teacher_targets])
+        src_idx, tgt_idx = indices[0]
+
+        if src_idx.numel() == 0:
+            zero = pred_logits.sum() * 0.0
+            self.losses_dict.update({
+                f'frame_{frame_id}_loss_distill_bbox': zero,
+                f'frame_{frame_id}_loss_distill_cls': zero,
+            })
+            return
+
+        student_boxes = pred_boxes[0, src_idx]
+        teacher_boxes = teacher_targets['boxes'][tgt_idx]
+        loss_bbox = F.l1_loss(student_boxes, teacher_boxes, reduction='mean')
+
+        student_logits = pred_logits[0, src_idx]
+        teacher_logits = teacher_targets['logits'][tgt_idx]
+        if teacher_logits.shape[-1] != student_logits.shape[-1]:
+            teacher_logits = teacher_logits.max(dim=-1, keepdim=True)[0]
+        loss_cls = F.binary_cross_entropy_with_logits(student_logits, teacher_logits.sigmoid(), reduction='mean')
+
+        self.losses_dict.update({
+            f'frame_{frame_id}_loss_distill_bbox': loss_bbox,
+            f'frame_{frame_id}_loss_distill_cls': loss_cls,
+        })
 
     def calc_loss_for_track_scores(self, track_instances: Instances):
         frame_id = self._current_frame_idx - 1
@@ -124,7 +224,7 @@ class ClipMatcher(SetCriterion):
            The target boxes are expected in format (center_x, center_y, h, w), normalized by the image size.
         """
         # We ignore the regression loss of the track-disappear slots.
-        #TODO: Make this filter process more elegant.
+        # TODO: Make this filter process more elegant.
         filtered_idx = []
         for src_per_img, tgt_per_img in indices:
             keep = tgt_per_img != -1
@@ -135,7 +235,8 @@ class ClipMatcher(SetCriterion):
         target_boxes = torch.cat([gt_per_img.boxes[i] for gt_per_img, (_, i) in zip(gt_instances, indices)], dim=0)
 
         # for pad target, don't calculate regression loss, judged by whether obj_id=-1
-        target_obj_ids = torch.cat([gt_per_img.obj_ids[i] for gt_per_img, (_, i) in zip(gt_instances, indices)], dim=0) # size(16)
+        target_obj_ids = torch.cat([gt_per_img.obj_ids[i] for gt_per_img, (_, i) in zip(gt_instances, indices)],
+                                   dim=0)  # size(16)
         mask = (target_obj_ids != -1)
 
         loss_bbox = F.l1_loss(src_boxes[mask], target_boxes[mask], reduction='none')
@@ -169,13 +270,14 @@ class ClipMatcher(SetCriterion):
         target_classes_o = torch.cat(labels)
         target_classes[idx] = target_classes_o
         if self.focal_loss:
-            gt_labels_target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[:, :, :-1]  # no loss for the last (background) class
+            gt_labels_target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[
+                :, :, :-1]  # no loss for the last (background) class
             gt_labels_target = gt_labels_target.to(src_logits)
             loss_ce = sigmoid_focal_loss(src_logits.flatten(1),
-                                             gt_labels_target.flatten(1),
-                                             alpha=0.25,
-                                             gamma=2,
-                                             num_boxes=num_boxes, mean_in_dim1=False)
+                                         gt_labels_target.flatten(1),
+                                         alpha=0.25,
+                                         gamma=2,
+                                         num_boxes=num_boxes, mean_in_dim1=False)
             loss_ce = loss_ce.sum()
         else:
             loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
@@ -187,7 +289,7 @@ class ClipMatcher(SetCriterion):
 
         return losses
 
-    def loss_refers(self,  outputs, gt_instances: List[Instances], indices: List[tuple], num_boxes):
+    def loss_refers(self, outputs, gt_instances: List[Instances], indices: List[tuple], num_boxes):
 
         filtered_idx = []
         for src_per_img, tgt_per_img in indices:
@@ -219,17 +321,16 @@ class ClipMatcher(SetCriterion):
         track_instances: Instances = outputs_without_aux['track_instances']
         pred_logits_i = outputs_without_aux['pred_logits'][0]  # predicted logits of i-th image.
         pred_boxes_i = outputs_without_aux['pred_boxes'][0]  # predicted boxes of i-th image.
-        pred_refers_i = outputs_without_aux['pred_refers'][0] # predicted refer scores of i-th image
+        pred_refers_i = outputs_without_aux['pred_refers'][0]  # predicted refer scores of i-th image
 
         obj_idxes = gt_instances_i.obj_ids
         obj_idxes_list = obj_idxes.detach().cpu().numpy().tolist()
         obj_idx_to_gt_idx = {obj_idx: gt_idx for gt_idx, obj_idx in enumerate(obj_idxes_list)}
         outputs_i = {
-            'pred_logits': pred_logits_i.unsqueeze(0), 
-            'pred_boxes': pred_boxes_i.unsqueeze(0), 
-            'pred_refers': pred_refers_i.unsqueeze(0), 
+            'pred_logits': pred_logits_i.unsqueeze(0),
+            'pred_boxes': pred_boxes_i.unsqueeze(0),
+            'pred_refers': pred_refers_i.unsqueeze(0),
         }
-
 
         # step1. inherit and update the previous tracks.
         num_disappear_track = 0
@@ -267,7 +368,7 @@ class ClipMatcher(SetCriterion):
 
         def match_for_single_decoder_layer(unmatched_outputs, matcher):
             new_track_indices = matcher(unmatched_outputs,
-                                             [untracked_gt_instances])  # list[tuple(src_idx, tgt_idx)]
+                                        [untracked_gt_instances])  # list[tuple(src_idx, tgt_idx)]
 
             src_idx = new_track_indices[0][0]
             tgt_idx = new_track_indices[0][1]
@@ -340,24 +441,23 @@ class ClipMatcher(SetCriterion):
         self._step()
         return track_instances
 
+    def loss_hist_reasoning(self, track_instances: Instances):
 
-    def loss_hist_reasoning(self,track_instances:Instances):
-        
-        frame_id = self._current_frame_idx-1
+        frame_id = self._current_frame_idx - 1
         gt_instances_i = self.gt_instances[frame_id]
-        pred_logits_i = track_instances.cache_pred_logits  
-        pred_boxes_i = track_instances.cache_pred_boxes  
-        pred_refers_i = track_instances.cache_pred_refers 
+        pred_logits_i = track_instances.cache_pred_logits
+        pred_boxes_i = track_instances.cache_pred_boxes
+        pred_refers_i = track_instances.cache_pred_refers
         outputs_i = {
-            'pred_logits': pred_logits_i.unsqueeze(0), 
-            'pred_boxes': pred_boxes_i.unsqueeze(0), 
-            'pred_refers': pred_refers_i.unsqueeze(0), 
+            'pred_logits': pred_logits_i.unsqueeze(0),
+            'pred_boxes': pred_boxes_i.unsqueeze(0),
+            'pred_refers': pred_refers_i.unsqueeze(0),
         }
 
         num_tracks = len(track_instances)
         device = track_instances.track_scores.device
-        src_idx = torch.arange(num_tracks,dtype=torch.long,device=device) 
-        tgt_idx = track_instances.matched_gt_idxes 
+        src_idx = torch.arange(num_tracks, dtype=torch.long, device=device)
+        tgt_idx = track_instances.matched_gt_idxes
 
         losses = ['labels', 'boxes', 'refers']
         for loss in losses:
@@ -369,9 +469,9 @@ class ClipMatcher(SetCriterion):
             self.losses_dict.update(
                 {'frame_{}_temporal_{}'.format(frame_id, key): value for key, value in new_track_loss.items()})
         return
-    
-    def calc_iou(self,track_instances:Instances):
-        frame_id = self._current_frame_idx-1
+
+    def calc_iou(self, track_instances: Instances):
+        frame_id = self._current_frame_idx - 1
         gt_instances_i = self.gt_instances[frame_id]
         active_idxes = (track_instances.obj_idxes >= 0) & (track_instances.matched_gt_idxes >= 0)
         active_track_boxes = track_instances.cache_pred_boxes[active_idxes]
@@ -419,6 +519,7 @@ class RuntimeTrackerBase(object):
 
 class TrackerPostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
+
     def __init__(self):
         super().__init__()
 
@@ -464,7 +565,8 @@ def _get_clones(module, N):
 
 class TransRMOT(nn.Module):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels, criterion, track_embed,
-                 aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False,tracking=False,hist_len=4):
+                 aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False,tracking=False,hist_len=4,
+                 distill_teacher=True, distill_teacher_config='/home/mskim/DKGTrack/GroundingDINO/groundingdino/config/GroundingDINO_SwinB_cfg.py', distill_teacher_checkpoint='/home/mskim/DKGTrack/GroundingDINO/weights/groundingdino_swinb_cogcoor.pth'):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -479,22 +581,38 @@ class TransRMOT(nn.Module):
         super().__init__()
         self.tracking = tracking
         self.num_queries = num_queries
-        self.track_embed = track_embed # QIM
-        self.transformer = transformer # deformable detr plus
-        hidden_dim = transformer.d_model 
-        self.num_classes = num_classes 
+        self.track_embed = track_embed  # QIM
+        self.transformer = transformer  # deformable detr plus
+        hidden_dim = transformer.d_model
+        self.num_classes = num_classes
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-        self.refer_embed = nn.Linear(hidden_dim, 1) # this is referring branch
+        self.refer_embed = nn.Linear(hidden_dim, 1)  # this is referring branch
         self.num_feature_levels = num_feature_levels
         self.use_checkpoint = use_checkpoint
-        
+
         # Temporal Enhancement Module
         self.STReasoner = SpatialTemporalReasoner(hist_len=hist_len)
         self.hist_len = hist_len
+        self.distill_teacher = distill_teacher
+        self.teacher_model = None
+        if self.distill_teacher:
+            if len(distill_teacher_checkpoint) > 0:
+                if load_model  is None:
+                    raise ImportError("GroundingDINO import failed. Ensure local GroundingDINO package is available.")
+                self.teacher_model = load_model(
+                    distill_teacher_config,
+                    distill_teacher_checkpoint,
+                    device='cpu',
+                )
+                self.teacher_model.eval()
+                for p in self.teacher_model.parameters():
+                    p.requires_grad_(False)
+            else:
+                raise ValueError("--distill_teacher requires --distill_teacher_checkpoint to load pretrained Grounding DINO.")
 
         if not two_stage:
-            self.query_embed = nn.Embedding(num_queries, hidden_dim*2) #(300,256)
+            self.query_embed = nn.Embedding(num_queries, hidden_dim * 2)  # (300,256)
 
         if num_feature_levels > 1:
             num_backbone_outs = len(backbone.strides)
@@ -519,9 +637,9 @@ class TransRMOT(nn.Module):
                     nn.GroupNorm(32, hidden_dim),
                 )])
         self.backbone = backbone
-        self.aux_loss = aux_loss # true
-        self.with_box_refine = with_box_refine # true
-        self.two_stage = two_stage #False
+        self.aux_loss = aux_loss  # true
+        self.with_box_refine = with_box_refine  # true
+        self.two_stage = two_stage  # False
 
         self.init_params_and_layers(hidden_dim)
         # language encoder
@@ -529,9 +647,9 @@ class TransRMOT(nn.Module):
         # self.text_encoder = RobertaModel.from_pretrained(text_encoder_type)
         # self.text_encoder.pooler = None  # this pooler is never used, this is a hack to avoid DDP problems...
 
-        self.tokenizer = RobertaTokenizerFast.from_pretrained('/data2/lgy/RMOT/work3/TRMOT3_1/roberta_base/',
+        self.tokenizer = RobertaTokenizerFast.from_pretrained('/home/mskim/DKGTrack/roberta-base/',
                                                               local_files_only=True)
-        self.text_encoder = RobertaModel.from_pretrained('/data2/lgy/RMOT/work3/TRMOT3_1/roberta_base/',
+        self.text_encoder = RobertaModel.from_pretrained('/home/mskim/DKGTrack/roberta-base/',
                                                          local_files_only=True)
         self.nlp = spacy.load('en_core_web_sm')
         freeze_text_encoder = True
@@ -557,7 +675,7 @@ class TransRMOT(nn.Module):
             self.tokenizer.convert_tokens_to_ids("?")
         ]
 
-        prior_prob = 0.01 # positive prior probability
+        prior_prob = 0.01  # positive prior probability
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         self.class_embed.bias.data = torch.ones(num_classes) * bias_value
         nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
@@ -569,7 +687,7 @@ class TransRMOT(nn.Module):
 
         # if two-stage, the last class_embed and bbox_embed is for region proposal generation
         num_pred = (transformer.decoder.num_layers + 1) if two_stage else transformer.decoder.num_layers
-        if with_box_refine: # True
+        if with_box_refine:  # True
             self.class_embed = _get_clones(self.class_embed, num_pred)
             self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
@@ -602,42 +720,48 @@ class TransRMOT(nn.Module):
         reference_points = self.transformer.reference_points(self.query_embed.weight[:, :dim // 2])
 
         """Detection queries 3,3"""
-        track_instances.ref_pts = reference_points.clone() # first hidden_dim for init point prediction
+        track_instances.ref_pts = reference_points.clone()  # first hidden_dim for init point prediction
         track_instances.query_pos = query_embeds.clone()
 
-        
         """Tracking information 3,4"""
-        track_instances.obj_idxes = torch.full((len(track_instances),), -1, dtype=torch.long, device=device) # id for the tracks
-        track_instances.matched_gt_idxes = torch.full((len(track_instances),), -1, dtype=torch.long, device=device)# matched gt indexes, for loss computation
-        track_instances.disappear_time = torch.zeros((len(track_instances), ), dtype=torch.long, device=device)# life cycle management
+        track_instances.obj_idxes = torch.full((len(track_instances),), -1, dtype=torch.long,
+                                               device=device)  # id for the tracks
+        track_instances.matched_gt_idxes = torch.full((len(track_instances),), -1, dtype=torch.long,
+                                                      device=device)  # matched gt indexes, for loss computation
+        track_instances.disappear_time = torch.zeros((len(track_instances),), dtype=torch.long,
+                                                     device=device)  # life cycle management
         track_instances.track_query_mask = torch.zeros(
-            (len(track_instances), ), dtype=torch.bool, device=device)
-        """Current frame information """   
+            (len(track_instances),), dtype=torch.bool, device=device)
+        """Current frame information """
         track_instances.iou = torch.ones((len(track_instances),), dtype=torch.float, device=device)
         track_instances.scores = torch.zeros((len(track_instances),), dtype=torch.float, device=device)
         track_instances.track_scores = torch.zeros((len(track_instances),), dtype=torch.float, device=device)
         track_instances.pred_boxes = torch.zeros((len(track_instances), 4), dtype=torch.float, device=device)
-        track_instances.pred_logits = torch.zeros((len(track_instances), self.num_classes), dtype=torch.float, device=device)
+        track_instances.pred_logits = torch.zeros((len(track_instances), self.num_classes), dtype=torch.float,
+                                                  device=device)
         track_instances.pred_refers = torch.zeros((len(track_instances), 1), dtype=torch.float, device=device)
 
         """Cache for current frame information, loading temporary data for qim"""
         track_instances.cache_scores = torch.zeros((len(track_instances),), dtype=torch.float, device=device)
         track_instances.cache_pred_boxes = torch.zeros((len(track_instances), 4), dtype=torch.float, device=device)
-        track_instances.cache_pred_logits = torch.zeros((len(track_instances), self.num_classes), dtype=torch.float, device=device)
+        track_instances.cache_pred_logits = torch.zeros((len(track_instances), self.num_classes), dtype=torch.float,
+                                                        device=device)
         track_instances.cache_pred_refers = torch.zeros((len(track_instances), 1), dtype=torch.float, device=device)
 
-        # embedding 
+        # embedding
         track_instances.hist_embeds = torch.zeros(
-            (len(track_instances),self.hist_len,dim // 2),dtype=torch.float32,device=device)
+            (len(track_instances), self.hist_len, dim // 2), dtype=torch.float32, device=device)
         # padding mask, follow MultiHeadAttention, 1 indicates padded
         track_instances.hist_padding_masks = torch.ones(
             (len(track_instances), self.hist_len), dtype=torch.bool, device=device)
-       
-        track_instances.output_embedding = torch.zeros((num_queries, dim //2 ), device=device)
+
+        track_instances.output_embedding = torch.zeros((num_queries, dim // 2), device=device)
         mem_bank_len = self.mem_bank_len
-        track_instances.mem_bank = torch.zeros((len(track_instances), mem_bank_len, dim), dtype=torch.float32, device=device)
-        track_instances.mem_padding_mask = torch.ones((len(track_instances), mem_bank_len), dtype=torch.bool, device=device)
-        track_instances.save_period = torch.zeros((len(track_instances), ), dtype=torch.float32, device=device)
+        track_instances.mem_bank = torch.zeros((len(track_instances), mem_bank_len, dim), dtype=torch.float32,
+                                               device=device)
+        track_instances.mem_padding_mask = torch.ones((len(track_instances), mem_bank_len), dtype=torch.bool,
+                                                      device=device)
+        track_instances.save_period = torch.zeros((len(track_instances),), dtype=torch.float32, device=device)
 
         return track_instances.to(self.query_embed.weight.device)
 
@@ -663,8 +787,9 @@ class TransRMOT(nn.Module):
         return text_features, text_pad_mask, text_features
 
     def forward_text(self, text_queries, motion_map, subject_map, static_map, device):
-        
-        tokenized_queries = self.tokenizer.batch_encode_plus(text_queries, padding="longest", return_tensors='pt').to(device)
+
+        tokenized_queries = self.tokenizer.batch_encode_plus(text_queries, padding="longest", return_tensors='pt').to(
+            device)
 
         # with torch.inference_mode(mode=self.freeze_text_encoder):
         encoded_text = self.text_encoder(**tokenized_queries)
@@ -687,10 +812,10 @@ class TransRMOT(nn.Module):
         motion_feat = text_sentence_features[motion_map.bool()]
         static_feat = torch.cat([text_sentence_features[static_map.bool()], text_features], dim=0)
 
-        return text_features, text_pad_mask, text_sentence_features, motion_map, subject_map, static_map, motion_feat, static_feat, subject_feat  
+        return text_features, text_pad_mask, text_sentence_features, motion_map, subject_map, static_map, motion_feat, static_feat, subject_feat
 
     def _forward_single_image(self, samples, track_instances: Instances, sentences):
-        features, pos = self.backbone(samples) 
+        features, pos = self.backbone(samples)
         src, mask = features[-1].decompose()
         assert mask is not None
         motion_map, subject_map, static_map = self.proceesing_text_decoupling(sentences[0])
@@ -699,20 +824,21 @@ class TransRMOT(nn.Module):
         static_map = static_map.unsqueeze(0).to(src.device)
 
         # Extract linguistic features
-        text_sentence_features, text_word_mask, text_word_features,  motion_map, subject_map, static_map, motion_feat, static_feat, subject_feat = self.forward_text(sentences, motion_map, subject_map, static_map, src.device)
+        text_sentence_features, text_word_mask, text_word_features, motion_map, subject_map, static_map, motion_feat, static_feat, subject_feat = self.forward_text(
+            sentences, motion_map, subject_map, static_map, src.device)
         text_sentence_features = text_sentence_features.flatten(0, 1).unsqueeze(0)
         text_word_mask = text_word_mask.flatten(0, 1).unsqueeze(0)
         text_pos = self.text_pos(NestedTensor(text_word_features, text_word_mask)).permute(2, 0, 1)
-        subject_mask = torch.zeros((1, subject_feat.size(0)), dtype=torch.bool).to(src.device) 
-        static_mask = torch.zeros((1, static_feat.size(0)), dtype=torch.bool).to(src.device) 
+        subject_mask = torch.zeros((1, subject_feat.size(0)), dtype=torch.bool).to(src.device)
+        static_mask = torch.zeros((1, static_feat.size(0)), dtype=torch.bool).to(src.device)
         # subject_feat_pos = self.text_pos(NestedTensor(subject_feat, subject_mask)).permute(2, 0, 1)
         static_feat_pos = self.text_pos(NestedTensor(static_feat, static_mask)).permute(2, 0, 1)
         static_feat = static_feat.unsqueeze(0).permute(1, 0, 2)
         subject_feat = subject_feat.unsqueeze(0).permute(1, 0, 2)
 
         text_dict = {
-            "encoded_text": text_word_features,  
-            "text_word_mask": text_word_mask, 
+            "encoded_text": text_word_features,
+            "text_word_mask": text_word_mask,
             "motion_map": motion_map,
             "subject_map": subject_map,
             "static_map": static_map,
@@ -720,8 +846,8 @@ class TransRMOT(nn.Module):
             "motion_feat": motion_feat,
             "static_feat": static_feat,
             "subject_feat": subject_feat,
-            "static_feat_pos":static_feat_pos,
-            "static_mask":static_mask
+            "static_feat_pos": static_feat_pos,
+            "static_mask": static_mask
         }
 
         srcs = []
@@ -729,7 +855,7 @@ class TransRMOT(nn.Module):
 
         for l, feat in enumerate(features):
             src, mask = feat.decompose()
-            src_proj_l = self.input_proj[l](src) # 
+            src_proj_l = self.input_proj[l](src)  #
             n, c, h, w = src_proj_l.shape
 
             # vision and language fusion
@@ -746,7 +872,7 @@ class TransRMOT(nn.Module):
             masks.append(mask)
             assert mask is not None
 
-        if self.num_feature_levels > len(srcs): # add smallest scale
+        if self.num_feature_levels > len(srcs):  # add smallest scale
             _len_srcs = len(srcs)
             for l in range(_len_srcs, self.num_feature_levels):
                 if l == _len_srcs:
@@ -762,7 +888,7 @@ class TransRMOT(nn.Module):
                 src = self.fusion_module(tgt=src,
                                          memory=text_dict['static_feat'],
                                          memory_key_padding_mask=static_mask,
-                                         pos=static_feat_pos, #static_feat_pos
+                                         pos=static_feat_pos,  # static_feat_pos
                                          query_pos=None
                                          )
                 src = rearrange(src, '(h w) b c -> b c h w', h=h, w=w)
@@ -772,7 +898,8 @@ class TransRMOT(nn.Module):
                 pos.append(pos_l)
 
         hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
-            self.transformer(srcs, masks, pos, track_instances.query_pos, text_sentence_features, text_dict, ref_pts=track_instances.ref_pts)
+            self.transformer(srcs, masks, pos, track_instances.query_pos, text_sentence_features, text_dict,
+                             ref_pts=track_instances.ref_pts)
         outputs_classes = []
         outputs_coords = []
         outputs_refers = []
@@ -796,47 +923,62 @@ class TransRMOT(nn.Module):
             outputs_coords.append(outputs_coord)
             outputs_refers.append(outputs_refer)
 
-        outputs_class = torch.stack(outputs_classes) 
-        outputs_coord = torch.stack(outputs_coords) 
+        outputs_class = torch.stack(outputs_classes)
+        outputs_coord = torch.stack(outputs_coords)
         outputs_refer = torch.stack(outputs_refers)
         ref_pts_all = torch.cat([init_reference[None], inter_references[:, :, :, :2]], dim=0)
         last_query_feats = hs[-1]
         # last_query_embeds = track_instances.query_embeds.clone()
         out = {
-            'pred_logits': outputs_class[-1], 
-            'pred_boxes': outputs_coord[-1], 
-            'ref_pts': ref_pts_all[5], 
+            'pred_logits': outputs_class[-1],
+            'pred_boxes': outputs_coord[-1],
+            'ref_pts': ref_pts_all[5],
             'pred_refers': outputs_refer[-1],
-            'query_feats':last_query_feats,
-            }
+            'query_feats': last_query_feats,
+        }
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_refer)
-        out['text_word_mask'] = text_word_mask 
-        out['text_pos'] = text_pos 
-        out['text_word_features'] = text_word_features 
+        out['text_word_mask'] = text_word_mask
+        out['text_pos'] = text_pos
+        out['text_word_features'] = text_word_features
         return out
+    @torch.no_grad()
+    def _infer_teacher_outputs(self, frame: torch.Tensor, sentence: str):
+        if self.teacher_model is None:
+            return None
 
-
+        teacher_device = next(self.teacher_model.parameters()).device
+        frame_input = frame.unsqueeze(0).to(teacher_device)
+        caption = sentence if sentence.endswith('.') else sentence + '.'
+        teacher_outputs = self.teacher_model(frame_input, captions=[caption])
+        teacher_logits = teacher_outputs['pred_logits'][0]
+        teacher_boxes = teacher_outputs['pred_boxes'][0]
+        teacher_scores = teacher_logits.sigmoid().max(dim=-1)[0]
+        teacher_logits = teacher_logits.max(dim=-1, keepdim=True)[0]
+        return {
+            'boxes': teacher_boxes.detach(),
+            'logits': teacher_logits.detach(),
+            'scores': teacher_scores.detach(),
+        }
     def _post_process_single_image(self, frame_res, track_instances, is_last):
         frame_res['track_instances'] = track_instances
         text_result = {
-            'text_word_mask':frame_res.pop('text_word_mask'),
-            'text_pos':frame_res.pop('text_pos'),
-            'text_word_features':frame_res.pop('text_word_features')
+            'text_word_mask': frame_res.pop('text_word_mask'),
+            'text_pos': frame_res.pop('text_pos'),
+            'text_word_features': frame_res.pop('text_word_features')
         }
         if self.training:
             # the track id will be assigned by the mather.
             # Loss computation for the detection
             track_instances = self.criterion.match_for_single_frame(frame_res)
-        
-        if self.memory_bank is not None: #False
+
+        if self.memory_bank is not None:  # False
             track_instances = self.memory_bank(track_instances)
             if self.training:
                 self.criterion.calc_loss_for_track_scores(track_instances)
-        
-           
+
         if self.training:
-            track_instances = self.STReasoner(track_instances,text_result,training=True)
+            track_instances = self.STReasoner(track_instances, text_result, training=True)
             track_instances = self.criterion.calc_iou(track_instances)
             self.criterion.loss_hist_reasoning(track_instances)
             track_instances = self.frame_summarization(track_instances, tracking=False)
@@ -844,10 +986,10 @@ class TransRMOT(nn.Module):
             frame_res['pred_boxes'] = track_instances.pred_boxes
             frame_res['pred_refers'] = track_instances.pred_refers
         else:
-            track_instances = self.STReasoner(track_instances,text_result,training=False)
-            track_instances = self.frame_summarization(track_instances,tracking=True)
+            track_instances = self.STReasoner(track_instances, text_result, training=False)
+            track_instances = self.frame_summarization(track_instances, tracking=True)
             self.track_base.update(track_instances)
-        
+
         tmp = {}
         tmp['init_track_instances'] = self._generate_empty_tracks()
         tmp['track_instances'] = track_instances
@@ -858,7 +1000,6 @@ class TransRMOT(nn.Module):
             frame_res['track_instances'] = None
         return frame_res
 
-
     @torch.no_grad()
     def inference_single_image(self, img, sentence, ori_img_size, track_instances=None):
         if not isinstance(img, NestedTensor):
@@ -866,7 +1007,7 @@ class TransRMOT(nn.Module):
         if track_instances is None:
             track_instances = self._generate_empty_tracks()
         res = self._forward_single_image(img, track_instances=track_instances, sentences=sentence)
-        track_instances = self.load_detection_output_into_cache(track_instances,res)
+        track_instances = self.load_detection_output_into_cache(track_instances, res)
         res = self._post_process_single_image(res, track_instances, False)
 
         track_instances = res['track_instances']
@@ -880,42 +1021,41 @@ class TransRMOT(nn.Module):
             ret['ref_pts'] = ref_pts
         return ret
 
-    def init_params_and_layers(self,hidden_dim):
+    def init_params_and_layers(self, hidden_dim):
         """Generate the instances for tracking, especially the object queries
         """
         # query initialization for detection
         # reference points, mapping fourier encoding to embed_dims
         if self.tracking:
-            self.query_feat_embedding = nn.Embedding(self.num_queries,hidden_dim)
+            self.query_feat_embedding = nn.Embedding(self.num_queries, hidden_dim)
             nn.init.zeros_(self.query_feat_embedding.weight)
-    
-    def load_detection_output_into_cache(self,track_instances:Instances,out):
+
+    def load_detection_output_into_cache(self, track_instances: Instances, out):
         """ Load output of the detection head into the track_instances cache (inplace)
         """
         query_feats = out.pop('query_feats')
         # query_embeds = out.pop('query_embeds')
         with torch.no_grad():
-            if self.training:# True
+            if self.training:  # True
                 track_scores = out['pred_logits'][0, :].sigmoid().max(dim=-1).values
             else:
                 track_scores = out['pred_logits'][0, :, 0].sigmoid()
         track_instances.cache_scores = track_scores.clone()
-        track_instances.cache_pred_logits = out['pred_logits'][0].clone() 
-        track_instances.output_embedding = query_feats[0].clone() 
-        track_instances.cache_pred_boxes = out['pred_boxes'][0].clone() 
+        track_instances.cache_pred_logits = out['pred_logits'][0].clone()
+        track_instances.output_embedding = query_feats[0].clone()
+        track_instances.cache_pred_boxes = out['pred_boxes'][0].clone()
         track_instances.cache_pred_refers = out['pred_refers'][0].clone()
         return track_instances
-
 
     def frame_summarization(self, track_instances, tracking):
         """ Load the results after spatial-temporal reasoning into track instances
         """
-        track_instances.pred_logits= track_instances.cache_pred_logits 
+        track_instances.pred_logits = track_instances.cache_pred_logits
         track_instances.scores = track_instances.cache_scores
-        track_instances.pred_refers = track_instances.cache_pred_refers 
+        track_instances.pred_refers = track_instances.cache_pred_refers
         track_instances.pred_boxes = track_instances.cache_pred_boxes
         return track_instances
-    
+
     def proceesing_text_decoupling(self, text):
         doc = self.nlp(text)
         encoded_input = self.tokenizer(text, return_tensors="pt", add_special_tokens=True, return_offsets_mapping=True)
@@ -930,15 +1070,15 @@ class TransRMOT(nn.Module):
         found_subject = False
 
         for index, (rt, offset) in enumerate(zip(roberta_tokens, roberta_offsets)):
-            
+
             start, end = offset
 
             if rt != '<s>' and rt != '</s>' and rt != '.' and rt != '-':
                 for token in doc:
-                    if token.idx <= start and (token.idx + len(token.text)) >= end: 
+                    if token.idx <= start and (token.idx + len(token.text)) >= end:
 
                         if token.pos_ == 'NOUN' and token.text != 'color' and not found_subject:
-                           
+
                             try:
                                 subject_map[index] = 1
                                 found_subject = True
@@ -953,7 +1093,7 @@ class TransRMOT(nn.Module):
                             except:
                                 break
                             break
-                        
+
                         elif token.pos_ == 'VERB' or token.pos_ == 'ADV':
                             try:
                                 motion_map[index] = 1
@@ -966,14 +1106,14 @@ class TransRMOT(nn.Module):
                                 static_map[index] = 1
                             except:
                                 break
-                            break                
+                            break
 
-        static_map = static_map + subject_map 
+        static_map = static_map + subject_map
 
         return motion_map, subject_map, static_map
-    
+
     def generate_masks_with_special_tokens_and_transfer_map(self, tokenized, special_tokens_list, tokenizer):
-        
+
         input_ids = tokenized["input_ids"]
         bs, num_token = input_ids.shape
         # special_tokens_mask: bs, num_token. 1 for special tokens. 0 for normal tokens
@@ -997,12 +1137,12 @@ class TransRMOT(nn.Module):
                 attention_mask[row, col, col] = True
                 position_ids[row, col] = 0
             else:
-                attention_mask[row, previous_col + 1 : col + 1, previous_col + 1 : col + 1] = True
-                position_ids[row, previous_col + 1 : col + 1] = torch.arange(
+                attention_mask[row, previous_col + 1: col + 1, previous_col + 1: col + 1] = True
+                position_ids[row, previous_col + 1: col + 1] = torch.arange(
                     0, col - previous_col, device=input_ids.device
                 )
                 c2t_maski = torch.zeros((num_token), device=input_ids.device).bool()
-                c2t_maski[previous_col + 1 : col] = True
+                c2t_maski[previous_col + 1: col] = True
                 cate_to_token_mask_list[row].append(c2t_maski)
             previous_col = col
 
@@ -1015,10 +1155,10 @@ class TransRMOT(nn.Module):
         padding_mask = tokenized['attention_mask']
         attention_mask = attention_mask & padding_mask.unsqueeze(1).bool() & padding_mask.unsqueeze(2).bool()
 
-        return attention_mask, position_ids.to(torch.long)  
+        return attention_mask, position_ids.to(torch.long)
 
+        # @autocast()
 
-    # @autocast()
     def forward(self, data: dict):
         # data_dict = copy.deepcopy(data)
         if self.training:
@@ -1036,6 +1176,7 @@ class TransRMOT(nn.Module):
         keys = list(track_instances._fields.keys())
         for frame_index, frame in enumerate(frames):
             frame.requires_grad = False
+            raw_frame = frame
             is_last = frame_index == len(frames) - 1
             if self.use_checkpoint and frame_index < len(frames) - 1:
                 def fn(frame, *args):
@@ -1066,7 +1207,7 @@ class TransRMOT(nn.Module):
                     'pred_refers': tmp[2],
                     'ref_pts': tmp[3],
                     'query_feats': tmp[4],
-                    'text_word_mask': tmp[5] ,
+                    'text_word_mask': tmp[5],
                     'text_pos': tmp[6],
                     'text_word_features': tmp[7],
                     'aux_outputs': [{
@@ -1079,7 +1220,14 @@ class TransRMOT(nn.Module):
                 frame = nested_tensor_from_tensor_list([frame])
                 # frame.requires_grad = False
                 frame_res = self._forward_single_image(frame, track_instances, sentences)
-
+            if self.training and self.distill_teacher:
+                teacher_outputs = None
+                if 'teacher_outputs' in data and data['teacher_outputs'] is not None and frame_index < len(data['teacher_outputs']):
+                    teacher_outputs = data['teacher_outputs'][frame_index]
+                elif self.teacher_model is not None:
+                    teacher_sentence = sentences[0] if isinstance(sentences, list) and len(sentences) > 0 else ''
+                    teacher_outputs = self._infer_teacher_outputs(raw_frame, teacher_sentence)
+                self.criterion.calc_distill_loss_for_single_frame(frame_res, teacher_outputs)
 
             track_instances = self.load_detection_output_into_cache(track_instances, frame_res)
             frame_res = self._post_process_single_image(frame_res, track_instances, is_last)
@@ -1110,12 +1258,13 @@ def build(args):
 
     transformer = build_deforamble_transformer(args)
     d_model = transformer.d_model
-    hidden_dim = args.dim_feedforward 
-    query_interaction_layer = build_query_interaction_layer(args, args.query_interaction_layer, d_model, hidden_dim, d_model*2)
+    hidden_dim = args.dim_feedforward
+    query_interaction_layer = build_query_interaction_layer(args, args.query_interaction_layer, d_model, hidden_dim,
+                                                            d_model * 2)
 
     img_matcher = build_matcher(args)
     print(args)
-    num_frames_per_batch = max(args.sampler_lengths)# 2
+    num_frames_per_batch = max(args.sampler_lengths)  # 2
     weight_dict = {}
     for i in range(num_frames_per_batch):
         weight_dict.update({"frame_{}_loss_ce".format(i): args.cls_loss_coef,
@@ -1127,7 +1276,11 @@ def build(args):
                             'frame_{}_temporal_loss_giou'.format(i): args.giou_loss_coef,
                             'frame_{}_temporal_loss_refer'.format(i): args.refer_loss_coef,
                             })
-
+        if args.distill_teacher:
+            weight_dict.update({
+                f"frame_{i}_loss_distill_bbox": args.distill_box_coef,
+                f"frame_{i}_loss_distill_cls": args.distill_cls_coef,
+            })
     # TODO this is a hack
     if args.aux_loss:
         for i in range(num_frames_per_batch):
@@ -1144,7 +1297,9 @@ def build(args):
     else:
         memory_bank = None
     losses = ['labels', 'boxes', 'refers']
-    criterion = ClipMatcher(num_classes, matcher=img_matcher, weight_dict=weight_dict, losses=losses)
+    criterion = ClipMatcher(num_classes, matcher=img_matcher, weight_dict=weight_dict, losses=losses,
+                            distill_teacher=args.distill_teacher,
+                            distill_score_thresh=args.distill_score_thresh)
     criterion.to(device)
     postprocessors = {}
     model = TransRMOT(
@@ -1160,7 +1315,10 @@ def build(args):
         two_stage=args.two_stage,
         memory_bank=memory_bank,
         use_checkpoint=args.use_checkpoint,
-        tracking = args.tracking,
-        hist_len = args.hist_len
+        tracking=args.tracking,
+        hist_len = args.hist_len,
+        distill_teacher=args.distill_teacher,
+        distill_teacher_config=args.distill_teacher_config,
+        distill_teacher_checkpoint=args.distill_teacher_checkpoint,
     )
     return model, criterion, postprocessors
