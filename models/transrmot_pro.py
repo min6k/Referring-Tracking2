@@ -47,27 +47,13 @@ from torch.cuda.amp import autocast as autocast
 from .spatial_temporal_reason import SpatialTemporalReasoner
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface tokenizer warning (printed every epoch)
-import os
-import sys
 
-try:
-    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    if _repo_root not in sys.path:
-        sys.path.insert(0, _repo_root)
-
-    from GroundingDINO.groundingdino.util.inference import load_model
-
-except Exception as e:
-    print("GroundingDINO import failed:", repr(e))
-    load_model  = None
 class ClipMatcher(SetCriterion):
     def __init__(self, num_classes,
                  matcher,
                  weight_dict,
-                 losses,
-                 distill_teacher=True,
-                 distill_score_thresh=0.3):
+                 losses):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -84,8 +70,7 @@ class ClipMatcher(SetCriterion):
         self.focal_loss = True
         self.losses_dict = {}
         self._current_frame_idx = 0
-        self.distill_teacher = distill_teacher
-        self.distill_score_thresh = distill_score_thresh
+
     def initialize_for_single_clip(self, gt_instances: List[Instances], dataset_name=None):
         self.gt_instances = gt_instances
         self.num_samples = 0
@@ -96,89 +81,6 @@ class ClipMatcher(SetCriterion):
 
     def _step(self):
         self._current_frame_idx += 1
-
-    def _build_teacher_targets(self, teacher_outputs: dict, device: torch.device):
-        if teacher_outputs is None:
-            return None
-
-        boxes = teacher_outputs.get('boxes', None)
-        logits = teacher_outputs.get('logits', None)
-        scores = teacher_outputs.get('scores', None)
-        labels = teacher_outputs.get('labels', None)
-        if boxes is None or logits is None:
-            return None
-
-        boxes = boxes.to(device)
-        logits = logits.to(device)
-
-        if boxes.numel() == 0:
-            return None
-
-        if scores is None:
-            scores = logits[..., 0].sigmoid()
-        else:
-            scores = scores.to(device)
-
-        keep = scores >= self.distill_score_thresh
-        if keep.ndim > 1:
-            keep = keep.squeeze(-1)
-        if keep.sum() == 0:
-            return None
-
-        boxes = boxes[keep]
-        logits = logits[keep]
-
-        if labels is None:
-            labels = torch.zeros((boxes.shape[0],), dtype=torch.int64, device=device)
-        else:
-            labels = labels.to(device)[keep].long()
-
-        return {'boxes': boxes, 'logits': logits, 'labels': labels}
-
-    def calc_distill_loss_for_single_frame(self, student_outputs: dict, teacher_outputs: dict):
-        if not self.distill_teacher:
-            return
-
-        frame_id = self._current_frame_idx
-        pred_logits = student_outputs['pred_logits']
-        pred_boxes = student_outputs['pred_boxes']
-        device = pred_logits.device
-
-        teacher_targets = self._build_teacher_targets(teacher_outputs, device)
-        if teacher_targets is None:
-            zero = pred_logits.sum() * 0.0
-            self.losses_dict.update({
-                f'frame_{frame_id}_loss_distill_bbox': zero,
-                f'frame_{frame_id}_loss_distill_cls': zero,
-            })
-            return
-
-        outputs = {'pred_logits': pred_logits, 'pred_boxes': pred_boxes}
-        indices = self.matcher(outputs, [teacher_targets])
-        src_idx, tgt_idx = indices[0]
-
-        if src_idx.numel() == 0:
-            zero = pred_logits.sum() * 0.0
-            self.losses_dict.update({
-                f'frame_{frame_id}_loss_distill_bbox': zero,
-                f'frame_{frame_id}_loss_distill_cls': zero,
-            })
-            return
-
-        student_boxes = pred_boxes[0, src_idx]
-        teacher_boxes = teacher_targets['boxes'][tgt_idx]
-        loss_bbox = F.l1_loss(student_boxes, teacher_boxes, reduction='mean')
-
-        student_logits = pred_logits[0, src_idx]
-        teacher_logits = teacher_targets['logits'][tgt_idx]
-        if teacher_logits.shape[-1] != student_logits.shape[-1]:
-            teacher_logits = teacher_logits.max(dim=-1, keepdim=True)[0]
-        loss_cls = F.binary_cross_entropy_with_logits(student_logits, teacher_logits.sigmoid(), reduction='mean')
-
-        self.losses_dict.update({
-            f'frame_{frame_id}_loss_distill_bbox': loss_bbox,
-            f'frame_{frame_id}_loss_distill_cls': loss_cls,
-        })
 
     def calc_loss_for_track_scores(self, track_instances: Instances):
         frame_id = self._current_frame_idx - 1
@@ -565,8 +467,8 @@ def _get_clones(module, N):
 
 class TransRMOT(nn.Module):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels, criterion, track_embed,
-                 aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False,tracking=False,hist_len=4,
-                 distill_teacher=True, distill_teacher_config='/home/mskim/DKGTrack/GroundingDINO/groundingdino/config/GroundingDINO_SwinB_cfg.py', distill_teacher_checkpoint='/home/mskim/DKGTrack/GroundingDINO/weights/groundingdino_swinb_cogcoor.pth'):
+                 aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False,
+                 tracking=False, hist_len=4):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -594,22 +496,6 @@ class TransRMOT(nn.Module):
         # Temporal Enhancement Module
         self.STReasoner = SpatialTemporalReasoner(hist_len=hist_len)
         self.hist_len = hist_len
-        self.distill_teacher = distill_teacher
-        self.teacher_model = None
-        if self.distill_teacher:
-            if len(distill_teacher_checkpoint) > 0:
-                if load_model  is None:
-                    raise ImportError("GroundingDINO import failed. Ensure local GroundingDINO package is available.")
-                self.teacher_model = load_model(
-                    distill_teacher_config,
-                    distill_teacher_checkpoint,
-                    device='cpu',
-                )
-                self.teacher_model.eval()
-                for p in self.teacher_model.parameters():
-                    p.requires_grad_(False)
-            else:
-                raise ValueError("--distill_teacher requires --distill_teacher_checkpoint to load pretrained Grounding DINO.")
 
         if not two_stage:
             self.query_embed = nn.Embedding(num_queries, hidden_dim * 2)  # (300,256)
@@ -942,24 +828,7 @@ class TransRMOT(nn.Module):
         out['text_pos'] = text_pos
         out['text_word_features'] = text_word_features
         return out
-    @torch.no_grad()
-    def _infer_teacher_outputs(self, frame: torch.Tensor, sentence: str):
-        if self.teacher_model is None:
-            return None
 
-        teacher_device = next(self.teacher_model.parameters()).device
-        frame_input = frame.unsqueeze(0).to(teacher_device)
-        caption = sentence if sentence.endswith('.') else sentence + '.'
-        teacher_outputs = self.teacher_model(frame_input, captions=[caption])
-        teacher_logits = teacher_outputs['pred_logits'][0]
-        teacher_boxes = teacher_outputs['pred_boxes'][0]
-        teacher_scores = teacher_logits.sigmoid().max(dim=-1)[0]
-        teacher_logits = teacher_logits.max(dim=-1, keepdim=True)[0]
-        return {
-            'boxes': teacher_boxes.detach(),
-            'logits': teacher_logits.detach(),
-            'scores': teacher_scores.detach(),
-        }
     def _post_process_single_image(self, frame_res, track_instances, is_last):
         frame_res['track_instances'] = track_instances
         text_result = {
@@ -1176,7 +1045,6 @@ class TransRMOT(nn.Module):
         keys = list(track_instances._fields.keys())
         for frame_index, frame in enumerate(frames):
             frame.requires_grad = False
-            raw_frame = frame
             is_last = frame_index == len(frames) - 1
             if self.use_checkpoint and frame_index < len(frames) - 1:
                 def fn(frame, *args):
@@ -1220,14 +1088,6 @@ class TransRMOT(nn.Module):
                 frame = nested_tensor_from_tensor_list([frame])
                 # frame.requires_grad = False
                 frame_res = self._forward_single_image(frame, track_instances, sentences)
-            if self.training and self.distill_teacher:
-                teacher_outputs = None
-                if 'teacher_outputs' in data and data['teacher_outputs'] is not None and frame_index < len(data['teacher_outputs']):
-                    teacher_outputs = data['teacher_outputs'][frame_index]
-                elif self.teacher_model is not None:
-                    teacher_sentence = sentences[0] if isinstance(sentences, list) and len(sentences) > 0 else ''
-                    teacher_outputs = self._infer_teacher_outputs(raw_frame, teacher_sentence)
-                self.criterion.calc_distill_loss_for_single_frame(frame_res, teacher_outputs)
 
             track_instances = self.load_detection_output_into_cache(track_instances, frame_res)
             frame_res = self._post_process_single_image(frame_res, track_instances, is_last)
@@ -1276,11 +1136,7 @@ def build(args):
                             'frame_{}_temporal_loss_giou'.format(i): args.giou_loss_coef,
                             'frame_{}_temporal_loss_refer'.format(i): args.refer_loss_coef,
                             })
-        if args.distill_teacher:
-            weight_dict.update({
-                f"frame_{i}_loss_distill_bbox": args.distill_box_coef,
-                f"frame_{i}_loss_distill_cls": args.distill_cls_coef,
-            })
+
     # TODO this is a hack
     if args.aux_loss:
         for i in range(num_frames_per_batch):
@@ -1297,9 +1153,7 @@ def build(args):
     else:
         memory_bank = None
     losses = ['labels', 'boxes', 'refers']
-    criterion = ClipMatcher(num_classes, matcher=img_matcher, weight_dict=weight_dict, losses=losses,
-                            distill_teacher=args.distill_teacher,
-                            distill_score_thresh=args.distill_score_thresh)
+    criterion = ClipMatcher(num_classes, matcher=img_matcher, weight_dict=weight_dict, losses=losses)
     criterion.to(device)
     postprocessors = {}
     model = TransRMOT(
@@ -1316,9 +1170,6 @@ def build(args):
         memory_bank=memory_bank,
         use_checkpoint=args.use_checkpoint,
         tracking=args.tracking,
-        hist_len = args.hist_len,
-        distill_teacher=args.distill_teacher,
-        distill_teacher_config=args.distill_teacher_config,
-        distill_teacher_checkpoint=args.distill_teacher_checkpoint,
+        hist_len=args.hist_len
     )
     return model, criterion, postprocessors
