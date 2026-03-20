@@ -24,8 +24,8 @@ import torch
 from torch.utils.data import DataLoader
 import datasets
 
-from util.tool import load_model
-import util.misc as utils
+from utils.tool import load_model
+import utils.misc as utils
 import datasets.samplers as samplers
 from datasets import build_dataset
 from engine import train_one_epoch, train_one_epoch_rmot
@@ -192,6 +192,35 @@ def get_args_parser():
     parser.add_argument('--hist_len', type=int, default=4)
     parser.add_argument('--lr_trans', type=float, default=1e-5)
     parser.add_argument('--save_dir', default='saved_models_rk/TRMOT_original')
+
+    # Grounding DINO teacher-student distillation
+    parser.add_argument('--distill_teacher', action='store_true', default=True,
+                        help='enable teacher-student distillation losses when teacher outputs are provided')
+    parser.add_argument('--distill_score_thresh', default=0.3, type=float,
+                        help='minimum teacher score to keep a pseudo target for distillation')
+    parser.add_argument('--groundingdino_config_path', type=str,
+                        default='/home/mskim/DKGTrack/GroundingDINO/groundingdino/config/GroundingDINO_SwinB_cfg.py',
+                        help='Grounding DINO teacher config path')
+    parser.add_argument('--groundingdino_checkpoint_path', type=str, default='/home/mskim/DKGTrack/GroundingDINO/weights/groundingdino_swinb_cogcoor.pth',
+                        help='')
+    parser.add_argument('--distill_query_coef', default=1.0, type=float,
+                        help='weight for query feature alignment distillation loss')
+    parser.add_argument('--distill_rank_coef', default=0.5, type=float,
+                        help='weight for candidate ranking distillation loss')
+    parser.add_argument('--distill_temperature', default=1.0, type=float,
+                        help='temperature for ranking distillation soft targets')
+    parser.add_argument('--use_groundingdino_refine',default=True,
+                        help='Enable GroundingDINO top-K box feature query refinement')
+    parser.add_argument('--groundingdino_topk', default=10, type=int,
+                        help='Top-K GroundingDINO boxes used for query refinement')
+    parser.add_argument('--groundingdino_box_threshold', default=0.35, type=float,
+                        help='Box threshold for GroundingDINO predictions')
+    parser.add_argument('--groundingdino_text_threshold', default=0.25, type=float,
+                        help='Text threshold for GroundingDINO predictions')
+    parser.add_argument('--groundingdino_refine_scale', default=0.1, type=float,
+                        help='Initial residual scale for GroundingDINO query refinement')
+    parser.add_argument('--groundingdino_refine_layers', default=2, type=int,
+                        help='Number of last decoder layers that apply GroundingDINO query refinement')
     # code end
     return parser
 
