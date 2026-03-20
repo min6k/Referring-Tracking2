@@ -20,8 +20,8 @@ from torch.nn.init import xavier_uniform_, constant_, uniform_, normal_
 
 from models.structures import Boxes, matched_boxlist_iou, pairwise_iou
 
-from util.misc import inverse_sigmoid
-from util.box_ops import box_cxcywh_to_xyxy
+from utils.misc import inverse_sigmoid
+from utils.box_ops import box_cxcywh_to_xyxy
 from models.ops.modules import MSDeformAttn
 from einops import rearrange, repeat
 from .fuse_modules import BiAttentionBlock
@@ -36,7 +36,8 @@ class DeformableTransformer(nn.Module):
                  activation="relu", return_intermediate_dec=False,
                  num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
                  two_stage=False, two_stage_num_proposals=300, decoder_self_cross=True, sigmoid_attn=False,
-                 extra_track_attn=False):
+                 extra_track_attn=False, groundingdino_refine_scale=0.1,
+                 groundingdino_refine_layers=2):
         super().__init__()
 
         self.new_frame_adaptor = None
@@ -65,8 +66,21 @@ class DeformableTransformer(nn.Module):
                                                           num_feature_levels, nhead, dec_n_points, decoder_self_cross,
                                                           sigmoid_attn=sigmoid_attn, extra_track_attn=extra_track_attn)
         
-        self.decoder = DeformableTransformerDecoder(decoder_layer, feature_fusion_layer, num_decoder_layers, d_model, nhead, 
-                                                    dim_feedforward, dropout, activation,return_intermediate=return_intermediate_dec)
+        # self.decoder = DeformableTransformerDecoder(decoder_layer, feature_fusion_layer, num_decoder_layers, d_model, nhead,
+        #                                             dim_feedforward, dropout, activation,return_intermediate=return_intermediate_dec)
+        self.decoder = DeformableTransformerDecoder(
+            decoder_layer,
+            feature_fusion_layer,
+            num_decoder_layers,
+            d_model,
+            nhead,
+            dim_feedforward,
+            dropout,
+            activation,
+            return_intermediate=return_intermediate_dec,
+            groundingdino_refine_scale=groundingdino_refine_scale,
+            groundingdino_refine_layers=groundingdino_refine_layers,
+        )
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
  
@@ -406,17 +420,41 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
 class DeformableTransformerDecoder(nn.Module):
     def __init__(self, decoder_layer, feature_fusion_layer, num_layers, d_model, nhead, 
-                    dim_feedforward, dropout, activation, return_intermediate=False):
+                    # dim_feedforward, dropout, activation, return_intermediate=False):
+                 dim_feedforward, dropout, activation, return_intermediate=False,
+                 groundingdino_refine_scale=0.1, groundingdino_refine_layers=2):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
         self.num_layers = num_layers
         self.return_intermediate = return_intermediate
+        self.groundingdino_refine_layers = max(0, min(num_layers, groundingdino_refine_layers))
+        self.query_correction_start_layer = self.num_layers - self.groundingdino_refine_layers
         # hack implementation for iterative bounding box refinement and two-stage Deformable DETR
         self.bbox_embed = None
         self.class_embed = None
-        self.cross_static = VisionLanguageFusionModule(d_model=256,
-                    nhead=8,
-                    dropout=0.1)
+        # self.cross_static = VisionLanguageFusionModule(
+        #     d_model=d_model,
+        #     nhead=nhead,
+        #     dropout=dropout,
+        # )
+        self.cross_static = VisionLanguageFusionModule(
+            d_model=d_model,
+            nhead=nhead,
+            dropout=dropout,
+        )
+        self.query_correction_layers = nn.ModuleList([
+            GroundingDINOQueryCorrectionModule(
+                d_model=d_model,
+                nhead=nhead,
+                dropout=dropout,
+                init_scale=groundingdino_refine_scale,
+            )
+            for _ in range(num_layers)
+        ])
+        self.query_correction_layers = nn.ModuleList([
+            GroundingDINOQueryCorrectionModule(d_model=d_model, nhead=nhead, dropout=dropout)
+            for _ in range(num_layers)
+        ])
         self.fusion_layer = _get_clones(feature_fusion_layer, num_layers)
 
         # self.hiera_layer = _get_clones(hierarchical_layer, num_layers)
@@ -464,6 +502,42 @@ class DeformableTransformerDecoder(nn.Module):
         intermediate = []
         intermediate_reference_points = []
         for lid, layer in enumerate(self.layers):
+            if lid >= self.query_correction_start_layer and query_pos is not None and text_dict is not None:
+                gdino_memory = text_dict.get('groundingdino_topk_feat', None)
+                gdino_mask = text_dict.get('groundingdino_topk_mask', None)
+                text_memory = text_dict.get('encoded_text', None)
+                text_mask = text_dict.get('text_word_mask', None)
+
+                candidate_memory = None
+                candidate_mask = None
+                if gdino_memory is not None and text_memory is not None:
+                    if gdino_mask is None:
+                        gdino_mask = torch.zeros(
+                            (gdino_memory.shape[0], gdino_memory.shape[1]),
+                            dtype=torch.bool,
+                            device=gdino_memory.device,
+                        )
+                    if text_mask is None:
+                        text_mask = torch.zeros(
+                            (text_memory.shape[0], text_memory.shape[1]),
+                            dtype=torch.bool,
+                            device=text_memory.device,
+                        )
+                    candidate_memory = torch.cat([text_memory, gdino_memory], dim=1)
+                    candidate_mask = torch.cat([text_mask, gdino_mask], dim=1)
+                elif gdino_memory is not None:
+                    candidate_memory = gdino_memory
+                    candidate_mask = gdino_mask
+                else:
+                    candidate_memory = text_memory
+                    candidate_mask = text_mask
+
+                if candidate_memory is not None and candidate_memory.dim() == 3:
+                    query_pos = self.query_correction_layers[lid](
+                        query_pos.transpose(0, 1),
+                        candidate_memory.transpose(0, 1),
+                        memory_key_padding_mask=candidate_mask,
+                    ).transpose(0, 1)
             if reference_points.shape[-1] == 4:
                 reference_points_input = reference_points[:, :, None] \
                                          * torch.cat([src_valid_ratios, src_valid_ratios], -1)[:, None]
@@ -590,6 +664,26 @@ class VisionLanguageFusionModule(nn.Module):
         tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos), key=self.with_pos_embed(memory, pos), value=memory, attn_mask=None, key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + tgt2
         return tgt
+
+class GroundingDINOQueryCorrectionModule(nn.Module):
+    """GroundingDINO-style language-guided correction for object queries."""
+
+    def __init__(self, d_model, nhead, dropout=0.1, init_scale=0.1):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.scale = nn.Parameter(torch.ones(1) * init_scale)
+
+    def forward(self, query, text_memory, memory_key_padding_mask=None):
+        corrected_query = self.cross_attn(
+            query=query,
+            key=text_memory,
+            value=text_memory,
+            key_padding_mask=memory_key_padding_mask,
+        )[0]
+        query = self.norm(query + self.scale * self.dropout(corrected_query))
+        return query
 
 class SelfAttentionLayer(nn.Module):
 
@@ -822,6 +916,8 @@ def build_deforamble_transformer(args):
         decoder_self_cross=not args.decoder_cross_self,
         sigmoid_attn=args.sigmoid_attn,
         extra_track_attn=args.extra_track_attn,
+        groundingdino_refine_scale=args.groundingdino_refine_scale,
+        groundingdino_refine_layers=args.groundingdino_refine_layers,
     )
 
 

@@ -18,11 +18,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
-from typing import List
+from typing import List, Optional
 import copy
 import spacy
-from util import box_ops, checkpoint
-from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
+from utils import box_ops, checkpoint
+from utils.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        accuracy, get_world_size, interpolate, get_rank,
                        is_dist_avail_and_initialized, inverse_sigmoid)
 
@@ -45,7 +45,7 @@ from .segmentation import sigmoid_focal_loss
 from .position_encoding import PositionEmbeddingSine1D
 from torch.cuda.amp import autocast as autocast
 from .spatial_temporal_reason import SpatialTemporalReasoner
-
+from torchvision.ops import roi_align
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface tokenizer warning (printed every epoch)
 
 
@@ -468,7 +468,9 @@ def _get_clones(module, N):
 class TransRMOT(nn.Module):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels, criterion, track_embed,
                  aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False,
-                 tracking=False, hist_len=4):
+                 tracking=False, hist_len=4, nheads=8, use_groundingdino_refine=True, groundingdino_topk=10,
+                 groundingdino_box_threshold=0.35, groundingdino_text_threshold=0.25,
+                 groundingdino_config_path="/home/mskim/DKGTrack/GroundingDINO/groundingdino/config/GroundingDINO_SwinB_cfg.py", groundingdino_checkpoint_path="/home/mskim/DKGTrack/GroundingDINO/weights/groundingdino_swinb_cogcoor.pth"):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -598,6 +600,63 @@ class TransRMOT(nn.Module):
         self.memory_bank = memory_bank
         self.mem_bank_len = 0 if memory_bank is None else memory_bank.max_his_length
 
+        self.use_groundingdino_refine = use_groundingdino_refine
+        self.groundingdino_topk = groundingdino_topk
+        self.groundingdino_box_threshold = groundingdino_box_threshold
+        self.groundingdino_text_threshold = groundingdino_text_threshold
+        self.groundingdino_config_path = groundingdino_config_path
+        self.groundingdino_checkpoint_path = groundingdino_checkpoint_path
+        self.groundingdino_model = None
+        if self.use_groundingdino_refine:
+            import sys
+            from pathlib import Path
+            repo_root = Path(__file__).resolve().parents[1]
+            sys.path.insert(0, str(repo_root / "GroundingDINO"))
+            from groundingdino.util.inference import Model as GroundingDINOModel
+            self.groundingdino_model = GroundingDINOModel(
+                model_config_path=self.groundingdino_config_path,
+                model_checkpoint_path=self.groundingdino_checkpoint_path,
+                device=("cuda" if torch.cuda.is_available() else "cpu"),
+            )
+
+    def _build_groundingdino_topk_features(self, image_tensor: Tensor, sentence: str, src_feat: Tensor):
+        if self.groundingdino_model is None:
+            return None, None
+
+        image = image_tensor.detach().cpu().permute(1, 2, 0).numpy()
+        image = ((image * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])) * 255.0).clip(0,
+                                                                                                           255).astype(
+            np.uint8)
+        image_bgr = image[:, :, ::-1].copy()
+
+        detections, _ = self.groundingdino_model.predict_with_caption(
+            image=image_bgr,
+            caption=sentence,
+            box_threshold=self.groundingdino_box_threshold,
+            text_threshold=self.groundingdino_text_threshold,
+        )
+
+        if len(detections.xyxy) == 0:
+            return None, None
+
+        scores = torch.as_tensor(detections.confidence, device=src_feat.device, dtype=src_feat.dtype)
+        boxes_xyxy = torch.as_tensor(detections.xyxy, device=src_feat.device, dtype=src_feat.dtype)
+        topk = min(self.groundingdino_topk, boxes_xyxy.shape[0])
+        topk_idx = torch.topk(scores, k=topk, dim=0).indices
+        boxes_xyxy = boxes_xyxy[topk_idx]
+
+        _, _, feat_h, feat_w = src_feat.shape
+        img_h, img_w = image_tensor.shape[-2:]
+        boxes_xyxy[:, [0, 2]] = boxes_xyxy[:, [0, 2]] * (feat_w / float(img_w))
+        boxes_xyxy[:, [1, 3]] = boxes_xyxy[:, [1, 3]] * (feat_h / float(img_h))
+
+        rois = torch.cat([torch.zeros((topk, 1), device=src_feat.device, dtype=src_feat.dtype), boxes_xyxy], dim=1)
+        roi_feats = roi_align(src_feat, rois, output_size=(1, 1), spatial_scale=1.0, aligned=True).flatten(1)
+
+        topk_scores = scores[topk_idx].unsqueeze(-1)
+        roi_feats = roi_feats * topk_scores
+        return roi_feats.unsqueeze(0), topk_scores.unsqueeze(0)
+
     def _generate_empty_tracks(self):
         track_instances = Instances((1, 1))
         num_queries, dim = self.query_embed.weight.shape  # (300, 256)
@@ -704,6 +763,14 @@ class TransRMOT(nn.Module):
         features, pos = self.backbone(samples)
         src, mask = features[-1].decompose()
         assert mask is not None
+
+        groundingdino_topk_feat, groundingdino_topk_scores = None, None
+        if self.use_groundingdino_refine:
+            groundingdino_topk_feat, groundingdino_topk_scores = self._build_groundingdino_topk_features(
+                samples.tensors[0],
+                sentences[0],
+                self.input_proj[-1](src),
+            )
         motion_map, subject_map, static_map = self.proceesing_text_decoupling(sentences[0])
         motion_map = motion_map.unsqueeze(0).to(src.device)
         subject_map = subject_map.unsqueeze(0).to(src.device)
@@ -735,6 +802,15 @@ class TransRMOT(nn.Module):
             "static_feat_pos": static_feat_pos,
             "static_mask": static_mask
         }
+
+        if groundingdino_topk_feat is not None:
+            text_dict["groundingdino_topk_feat"] = groundingdino_topk_feat
+            text_dict["groundingdino_topk_mask"] = torch.zeros(
+                (groundingdino_topk_feat.shape[0], groundingdino_topk_feat.shape[1]),
+                dtype=torch.bool,
+                device=groundingdino_topk_feat.device,
+            )
+            text_dict["groundingdino_topk_scores"] = groundingdino_topk_scores
 
         srcs = []
         masks = []
@@ -1170,6 +1246,13 @@ def build(args):
         memory_bank=memory_bank,
         use_checkpoint=args.use_checkpoint,
         tracking=args.tracking,
-        hist_len=args.hist_len
+        hist_len=args.hist_len,
+        nheads=args.nheads,
+        use_groundingdino_refine=args.use_groundingdino_refine,
+        groundingdino_topk=args.groundingdino_topk,
+        groundingdino_box_threshold=args.groundingdino_box_threshold,
+        groundingdino_text_threshold=args.groundingdino_text_threshold,
+        groundingdino_config_path=args.groundingdino_config_path,
+        groundingdino_checkpoint_path=args.groundingdino_checkpoint_path
     )
     return model, criterion, postprocessors
